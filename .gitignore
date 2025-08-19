@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+sdkconfig
+sdkconfig.old
+
+# Environment variables and sensitive data
+.env
+*.pem
+*.key
+credentials.h # Or any file containing sensitive credentials
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Log files
+*.log
+
+# Dependency directories (if not managed by Git submodule)
+components/
