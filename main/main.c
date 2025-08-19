@@ -13,12 +13,19 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "esp_timer.h"
+
+// #define DEBUG
 
 // ===== CONFIGURABLE SETTINGS =====
-#define MOTOR_DRIVER_PIN         GPIO_NUM_2        // GPIO pin for motor driver control
-#define WATERING_INTERVAL_HOURS  8                 // Hours between watering cycles
+#define MOTOR_DRIVER_PIN         GPIO_NUM_14        // GPIO pin for motor driver control
+#define LIGHT_PIN                GPIO_NUM_2        // GPIO pin for built-in LED light
+#ifdef DEBUG
+#define WATERING_INTERVAL_HOURS  0.1                 // Hours between watering cycles
+#define WATERING_DURATION_MIN    1                // Minutes to keep water flowing
+#else
+#define WATERING_INTERVAL_HOURS  8  
 #define WATERING_DURATION_MIN    10                // Minutes to keep water flowing
+#endif
 #define WATERING_DURATION_MS     (WATERING_DURATION_MIN * 60 * 1000)  // Convert to milliseconds
 #define WATERING_INTERVAL_MS     (WATERING_INTERVAL_HOURS * 60 * 60 * 1000)  // Convert to milliseconds
 
@@ -26,17 +33,19 @@
 #define TAG "IRRIGATION_SYSTEM"
 #define STACK_SIZE               4096
 #define PRIORITY                 5
+#define TIMER_PERIOD_MS          1000              // Check every second instead of using very long timers
 
 // ===== GLOBAL VARIABLES =====
-static esp_timer_handle_t watering_timer;
-static esp_timer_handle_t interval_timer;
+static TimerHandle_t watering_timer;
+static TimerHandle_t check_timer;
 static bool is_watering = false;
+static uint32_t seconds_since_last_watering = 0;
 
 // ===== FUNCTION DECLARATIONS =====
 static void start_watering(void);
 static void stop_watering(void);
-static void watering_timer_callback(void* arg);
-static void interval_timer_callback(void* arg);
+static void watering_timer_callback(TimerHandle_t xTimer);
+static void check_timer_callback(TimerHandle_t xTimer);
 static void irrigation_task(void* pvParameters);
 
 void app_main(void)
@@ -44,12 +53,13 @@ void app_main(void)
     ESP_LOGI(TAG, "Starting Irrigation System...");
     ESP_LOGI(TAG, "Configuration:");
     ESP_LOGI(TAG, "  Motor Driver Pin: GPIO %d", MOTOR_DRIVER_PIN);
+    ESP_LOGI(TAG, "  Built-in Light Pin: GPIO %d", LIGHT_PIN);
     ESP_LOGI(TAG, "  Watering Interval: %d hours", WATERING_INTERVAL_HOURS);
     ESP_LOGI(TAG, "  Watering Duration: %d minutes", WATERING_DURATION_MIN);
     
-    // Configure GPIO pin for motor driver
+    // Configure GPIO pins for motor driver and light
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << MOTOR_DRIVER_PIN),
+        .pin_bit_mask = (1ULL << MOTOR_DRIVER_PIN) | (1ULL << LIGHT_PIN),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -57,22 +67,29 @@ void app_main(void)
     };
     gpio_config(&io_conf);
     
-    // Initialize motor driver pin to OFF state
+    // Initialize motor driver pin to OFF state and light to OFF state
     gpio_set_level(MOTOR_DRIVER_PIN, 0);
+    gpio_set_level(LIGHT_PIN, 0);
     ESP_LOGI(TAG, "Motor driver pin initialized to OFF state");
+    ESP_LOGI(TAG, "Built-in light initialized to OFF state");
     
     // Create timers
-    esp_timer_create_args_t watering_timer_args = {
-        .callback = watering_timer_callback,
-        .name = "watering_timer"
-    };
-    esp_timer_create(&watering_timer_args, &watering_timer);
+    watering_timer = xTimerCreate("watering_timer", 
+                                 pdMS_TO_TICKS(WATERING_DURATION_MS),
+                                 pdFALSE,  // One-shot timer
+                                 NULL, 
+                                 watering_timer_callback);
     
-    esp_timer_create_args_t interval_timer_args = {
-        .callback = interval_timer_callback,
-        .name = "interval_timer"
-    };
-    esp_timer_create(&interval_timer_args, &interval_timer);
+    check_timer = xTimerCreate("check_timer",
+                              pdMS_TO_TICKS(TIMER_PERIOD_MS),
+                              pdTRUE,   // Auto-reload timer
+                              NULL,
+                              check_timer_callback);
+    
+    if (watering_timer == NULL || check_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create timers");
+        return;
+    }
     
     // Create irrigation task
     xTaskCreate(irrigation_task, "irrigation_task", STACK_SIZE, NULL, PRIORITY, NULL);
@@ -87,20 +104,21 @@ static void irrigation_task(void* pvParameters)
     // Start the first watering cycle immediately
     start_watering();
     
-    // Start the interval timer for subsequent cycles
-    esp_timer_start_periodic(interval_timer, WATERING_INTERVAL_MS * 1000); // Convert to microseconds
+    // Start the check timer
+    xTimerStart(check_timer, 0);
     
-    // Task main loop
+    // Task main loop - just keep the task alive
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Check every second
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Sleep for 1 second
         
         // Log system status every hour
         static uint32_t hour_counter = 0;
         hour_counter++;
         if (hour_counter >= 3600) { // 3600 seconds = 1 hour
             hour_counter = 0;
+            uint32_t hours_until_next = (WATERING_INTERVAL_MS - seconds_since_last_watering * 1000) / (60 * 60 * 1000);
             ESP_LOGI(TAG, "System running - Next watering in %d hours", 
-                     is_watering ? WATERING_DURATION_MIN : WATERING_INTERVAL_HOURS);
+                     is_watering ? WATERING_DURATION_MIN : hours_until_next);
         }
     }
 }
@@ -114,12 +132,13 @@ static void start_watering(void)
     
     ESP_LOGI(TAG, "Starting watering cycle - Duration: %d minutes", WATERING_DURATION_MIN);
     
-    // Turn on motor driver
+    // Turn on motor driver and light
     gpio_set_level(MOTOR_DRIVER_PIN, 1);
+    gpio_set_level(LIGHT_PIN, 1);
     is_watering = true;
     
     // Start timer to stop watering
-    esp_timer_start_once(watering_timer, WATERING_DURATION_MS * 1000); // Convert to microseconds
+    xTimerStart(watering_timer, 0);
 }
 
 static void stop_watering(void)
@@ -131,19 +150,30 @@ static void stop_watering(void)
     
     ESP_LOGI(TAG, "Stopping watering cycle");
     
-    // Turn off motor driver
+    // Turn off motor driver and light
     gpio_set_level(MOTOR_DRIVER_PIN, 0);
+    gpio_set_level(LIGHT_PIN, 0);
     is_watering = false;
+    
+    // Reset the counter for next watering cycle
+    seconds_since_last_watering = 0;
 }
 
-static void watering_timer_callback(void* arg)
+static void watering_timer_callback(TimerHandle_t xTimer)
 {
     stop_watering();
     ESP_LOGI(TAG, "Watering cycle completed");
 }
 
-static void interval_timer_callback(void* arg)
+static void check_timer_callback(TimerHandle_t xTimer)
 {
-    ESP_LOGI(TAG, "Interval timer triggered - Starting new watering cycle");
-    start_watering();
+    if (!is_watering) {
+        seconds_since_last_watering++;
+        
+        // Check if it's time for the next watering cycle
+        if (seconds_since_last_watering * 1000 >= WATERING_INTERVAL_MS) {
+            ESP_LOGI(TAG, "Interval reached - Starting new watering cycle");
+            start_watering();
+        }
+    }
 }
