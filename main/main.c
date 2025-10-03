@@ -16,6 +16,7 @@
 
 // #define DEBUG
 
+
 // ===== CONFIGURABLE SETTINGS =====
 #define MOTOR_DRIVER_PIN         GPIO_NUM_14        // GPIO pin for motor driver control
 #define LIGHT_PIN                GPIO_NUM_2        // GPIO pin for built-in LED light
